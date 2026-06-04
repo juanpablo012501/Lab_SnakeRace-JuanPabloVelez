@@ -1,10 +1,8 @@
 package co.eci.snake.core;
 
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
+import co.eci.snake.concurrency.BoardSnapshot;
+
+import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 
 public final class Board {
@@ -16,7 +14,7 @@ public final class Board {
   private final Set<Position> turbo = new HashSet<>();
   private final Map<Position, Position> teleports = new HashMap<>();
 
-  public enum MoveResult { MOVED, ATE_MOUSE, HIT_OBSTACLE, ATE_TURBO, TELEPORTED }
+  public enum MoveResult { MOVED, ATE_MOUSE, HIT_OBSTACLE, ATE_TURBO, TELEPORTED, KILLED }
 
   public Board(int width, int height) {
     if (width <= 0 || height <= 0) throw new IllegalArgumentException("Board dimensions must be positive");
@@ -31,16 +29,24 @@ public final class Board {
   public int width() { return width; }
   public int height() { return height; }
 
-  public synchronized Set<Position> mice() { return new HashSet<>(mice); }
-  public synchronized Set<Position> obstacles() { return new HashSet<>(obstacles); }
-  public synchronized Set<Position> turbo() { return new HashSet<>(turbo); }
-  public synchronized Map<Position, Position> teleports() { return new HashMap<>(teleports); }
-
-  public synchronized MoveResult step(Snake snake) {
+  public synchronized MoveResult step(Snake snake, List<Snake> allSnakes) {
     Objects.requireNonNull(snake, "snake");
     var head = snake.head();
     var dir = snake.direction();
     Position next = new Position(head.x() + dir.dx, head.y() + dir.dy).wrap(width, height);
+
+      //Detección de colisión entre serpiente
+      boolean itDied = false;
+      for (Snake otherSnake : allSnakes) {
+          //la otra serpiente es válida para chocar
+          if (otherSnake != snake && otherSnake.isAlive()) {
+              //Colisión
+              if (otherSnake.snapshot().contains(next)) {
+                  snake.kill();
+                  itDied = true;
+              }
+          }
+      }
 
     if (obstacles.contains(next)) return MoveResult.HIT_OBSTACLE;
 
@@ -61,6 +67,7 @@ public final class Board {
       if (ThreadLocalRandom.current().nextDouble() < 0.2) turbo.add(randomEmpty());
     }
 
+    if(itDied) return MoveResult.KILLED;
     if (ateTurbo) return MoveResult.ATE_TURBO;
     if (ateMouse) return MoveResult.ATE_MOUSE;
     if (teleported) return MoveResult.TELEPORTED;
@@ -86,5 +93,12 @@ public final class Board {
       if (guard > width*height*2) break;
     } while (mice.contains(p) || obstacles.contains(p) || turbo.contains(p) || teleports.containsKey(p));
     return p;
+  }
+
+  public synchronized BoardSnapshot snapshot() {
+      return new BoardSnapshot(new HashSet<>(mice),
+              new  HashSet<>(obstacles),
+              new  HashSet<>(turbo),
+              new HashMap<>(teleports));
   }
 }

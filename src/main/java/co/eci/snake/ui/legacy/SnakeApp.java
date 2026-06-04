@@ -1,5 +1,7 @@
 package co.eci.snake.ui.legacy;
 
+import co.eci.snake.concurrency.BoardSnapshot;
+import co.eci.snake.concurrency.GameMonitor;
 import co.eci.snake.concurrency.SnakeRunner;
 import co.eci.snake.core.Board;
 import co.eci.snake.core.Direction;
@@ -10,6 +12,7 @@ import co.eci.snake.core.engine.GameClock;
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.ActionEvent;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
@@ -21,6 +24,8 @@ public final class SnakeApp extends JFrame {
   private final JButton actionButton;
   private final GameClock clock;
   private final java.util.List<Snake> snakes = new java.util.ArrayList<>();
+  private final GameMonitor monitor = new GameMonitor();
+  private final long startTime = System.currentTimeMillis();
 
   public SnakeApp() {
     super("The Snake Race");
@@ -45,10 +50,10 @@ public final class SnakeApp extends JFrame {
     pack();
     setLocationRelativeTo(null);
 
-    this.clock = new GameClock(60, () -> SwingUtilities.invokeLater(gamePanel::repaint));
+    this.clock = new GameClock(60, () -> SwingUtilities.invokeLater(gamePanel::repaint), monitor);
 
     var exec = Executors.newVirtualThreadPerTaskExecutor();
-    snakes.forEach(s -> exec.submit(new SnakeRunner(s, board)));
+    snakes.forEach(s -> exec.submit(new SnakeRunner(s, board, monitor, snakes)));
 
     actionButton.addActionListener((ActionEvent e) -> togglePause());
 
@@ -132,9 +137,35 @@ public final class SnakeApp extends JFrame {
     if ("Action".equals(actionButton.getText())) {
       actionButton.setText("Resume");
       clock.pause();
+      monitor.pause();
+
+      //Estadística
+      //Serpiente viva más larga
+      Snake longest = snakes.stream()
+              .filter(Snake::isAlive)
+              .max(Comparator.comparingInt(s -> s.snapshot().size()))
+              .orElse(null);
+
+      // Primera en morir
+      Snake worst = snakes.stream()
+              .filter(s -> !s.isAlive())
+              .min(Comparator.comparingLong(Snake::deathTime))
+              .orElse(null);
+
+      String msg = "";
+      msg += (longest != null)
+              ? "Serpiente viva más larga: " + longest.snapshot().size() + " segmentos\n"
+              : "No hay serpientes vivas\n";
+      msg += (worst != null)
+              ? "Serpiente que murió primero: vivió " + (worst.deathTime() - startTime) + " ms"
+              : "Ninguna serpiente ha muerto aún";
+
+      JOptionPane.showMessageDialog(this, msg, "Estadísticas", JOptionPane.INFORMATION_MESSAGE);
+
     } else {
       actionButton.setText("Action");
       clock.resume();
+      monitor.resume();
     }
   }
 
@@ -167,9 +198,11 @@ public final class SnakeApp extends JFrame {
       for (int y = 0; y <= board.height(); y++)
         g2.drawLine(0, y * cell, board.width() * cell, y * cell);
 
+      BoardSnapshot boardSnapshot = board.snapshot();
+
       // Obstáculos
       g2.setColor(new Color(255, 102, 0));
-      for (var p : board.obstacles()) {
+      for (var p : boardSnapshot.getObstacles()) {
         int x = p.x() * cell, y = p.y() * cell;
         g2.fillRect(x + 2, y + 2, cell - 4, cell - 4);
         g2.setColor(Color.RED);
@@ -181,7 +214,7 @@ public final class SnakeApp extends JFrame {
 
       // Ratones
       g2.setColor(Color.BLACK);
-      for (var p : board.mice()) {
+      for (var p : boardSnapshot.getMice()) {
         int x = p.x() * cell, y = p.y() * cell;
         g2.fillOval(x + 4, y + 4, cell - 8, cell - 8);
         g2.setColor(Color.WHITE);
@@ -190,7 +223,7 @@ public final class SnakeApp extends JFrame {
       }
 
       // Teleports (flechas rojas)
-      Map<Position, Position> tp = board.teleports();
+      Map<Position, Position> tp = boardSnapshot.getTeleports();
       g2.setColor(Color.RED);
       for (var entry : tp.entrySet()) {
         Position from = entry.getKey();
@@ -202,7 +235,7 @@ public final class SnakeApp extends JFrame {
 
       // Turbo (rayos)
       g2.setColor(Color.BLACK);
-      for (var p : board.turbo()) {
+      for (var p : boardSnapshot.getTurbo()) {
         int x = p.x() * cell, y = p.y() * cell;
         int[] xs = { x + 8, x + 12, x + 10, x + 14, x + 6, x + 10 };
         int[] ys = { y + 2, y + 2, y + 8, y + 8, y + 16, y + 10 };
@@ -213,6 +246,7 @@ public final class SnakeApp extends JFrame {
       var snakes = snakesSupplier.get();
       int idx = 0;
       for (Snake s : snakes) {
+        if(!s.isAlive()) continue;
         var body = s.snapshot().toArray(new Position[0]);
         for (int i = 0; i < body.length; i++) {
           var p = body[i];

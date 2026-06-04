@@ -143,6 +143,128 @@ Incluye compilación y ejecución de pruebas JUnit. Si tienes análisis estátic
 
 ---
 
+## Reporte de laboratorio - Parte II
+
+### 1) Análisis de concurrencia
+
+Al iniciar el juego el main utiliza el método launch de SnakeApp, el cual crea una instancia de SnakeApp y que delega su manejo al hilo Event Dispatch Thread de Swing.
+Al crear la instancia de SnakeApp, las sentencias:
+```
+    var exec = Executors.newVirtualThreadPerTaskExecutor();
+    snakes.forEach(s -> exec.submit(new SnakeRunner(s, board)));
+```
+Crean un `Executor` que delega la creación de un Thread por cada una de las tareas que se enlisten. Luego, por cada serpiente en el arreglo `snakes` crea
+una instancia de `SnakeRunner` (que implementa runnable) y luego `Executor` creará un **virtual thread** por cada runnable enlistado
+y en cada hilo se ejecutará el método `run()` de manera paralela a los demás.
+
+Ahora bien, con respecto a `Snake` y `SnakeRunner` (estado y actualización estado/movimiento) el método `snapshot()` le permite a SnakeApp pintar el estado de la serpiente
+y el método `run()` de `SnakeRunner` utiliza el método `step()` (de la clase `Board`), donde se utiliza el método `advance()` de `Snake` lo cual cambia el estado de la
+"serpiente", este hecho puede generar un **race condition**, ya que si en simultáneo con la ejecución del método `run()`, se está cambiando el estado de `Snake`, y el EDT
+utiliza el método `snapshot()` pues, la serpiente que se pinta puede tener un estado inconsistente o incluso lanzar un `ConcurrentModificationException`.
+
+Con respecto a `Board` el método `randomEmpty()` cómo se utiliza en el método `step()`, que aplica `synchronized` para hacer **lock** sobre el `Board` y esto
+también bloquea este método. De todas formas el único otro método que utiliza el `randomEmpty()` es el constructor de la clase y como no hay hilos de `SnakeRunner`
+para ese momento no hay posibilidad de que haya **race condition**. Por otro lado, los métodos:
+```
+    public synchronized Set<Position> mice()
+    public synchronized Set<Position> obstacles()
+    public synchronized Set<Position> turbo()
+    public synchronized Map<Position, Position> teleports()
+```
+Al ser llamados por `SnakeApp` para pintar sus elementos los llamados generan el **lock** sobre el objeto `Board`; pero, cómo estos llamados
+son sentencias en secuencia se da que `SnakeApp` pinta los **ratones** en un tiempo t, luego los obstaculos de un tiempo t+1 y el turbo en el tiempo t+2.
+Esto es un desface y muestra el tablero con estos elementos en tiempos distintos.
+
+Con respecto al `GameClock`  los métodos `pause()` y `resume()` solo cambian el atributo `state` no está suspendiendo el `scheduler`. Esto es **busy-wait**, puesto que
+el scheduler va a seguir ejecutando la tarea que se le asignó en el método `start()`; aunque el juego diga en su estado que está pausado. La tarea es:
+
+````
+        () -> {
+        if (state.get() == GameState.RUNNING) tick.run()
+        }
+````
+
+Finalmente, `SnakeRunner` ejecuta run() siempre y cuando su hilo no esté interrumpido; sin embargo, no exite mecanismo alguno para que este sepa cuando el juego está pausado.
+Así pues, `SnakeApp` no pinta más el estado; pero, el movimiento de las serpientes sigue ejecutandose, lo que genera también una inconsistencia
+entre lo que muestra la **UI** y el estado real del juego.
+
+### 2) Correcciones mínimas y regiones críticas
+
++ Para resolver el problema de la pausa y que los hilos de cada `SnakeRunner` puedan pausarse con el juego aplique el patron **monitor** para poder sincronizar todos los hilos
+de las serpientes. Cree la clase `GameMonitor` que es la clase que los hilos de las serpientes verifican para saber si el juego está en pausa o no.
+Se modificó `SnakeApp` donde se instancia un único `GameMonitor` y se le pasa a todos los `SnakeRunner` para que en el método `run()` hagan un `pauseMonitor.checkPause()` y
+así suspenderse todos y al reanudar el juego con un `notifyAll()` todo los hilos se reactivaran. En `SnakeApp` el método `togglePause()` cambia el estado del monitor `monitor.pause()` y
+`monitor.resume()`
+
++ Para resolver el problema de **race condition** donde el EDT podia utilizar el método `snapshot()` mientras otro hilo ejecutaba el `advance()` de la `Snake` simplemente
+agregamos a ambos método la palabra reservada `synchronized` que bloquea la snake apenas un hilo ejecuta alguno de los dos y haciendo esperar a los hilos que requieran utilizar
+a la serpiente.
+
++ Para la corrección de la desincronización en el tiempo en que `SnakeApp` pintaba los **ratones**, **turbos**, etc. cree una clase que llamada `BoardSnapshot` que es la
+foto completa de todos los elementos del tablero en un momento y para poder tomarla en la clase `Board` en vez de usar los metodos `mice()`, `obstacles()` cree el
+método `snapshot()` (que aplica `synchronized`) y que devuelve el BoardSnapshot para que `SnakeApp` construya una imagen consistente. Además, envia copias defensivas de los arreglos;
+es decir, que no se envian los arreglos originales los del objeto `Board`.
+
++ Aquí reutilicé el monitor que cree que ya maneja la pausa. En el GameClock agregué el atributo `pauseMonitor` y ahora en el método de `start` la tarea que se le asigna al
+  `scheduler` utiliza el método `checkPaused()` para saber si debe suspenderse; además, el único monitor que utilizan todos los `SnakeRunner` es el que se le envia a
+  `GameClock`.  También, algo a mencionar es que quitamos el condicional que estaba antes `if (state.get() == GameState.RUNNING)` y quedo de esta manera:
+
+````
+       scheduler.scheduleAtFixedRate(() -> {
+          try {
+              pauseMonitor.checkPaused();
+              tick.run();
+          } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+          }
+      }, 0, periodMillis, TimeUnit.MILLISECONDS);
+````
+
+### 3) Control de ejecución seguro (UI)
+
++ En `Snake` agregamos el atributo `alive` y `deathTime` para saber si la serpiente murio; Además,
+usamos el método `isAlive()` y `deathTime()` para dar a concer estos datos.
++ En `Board` agregamos el **enum** `KILLED` para que el método step devuelva esta respuesta dado
+el caso en que la serpiente colisione con otro. Además, adecuamos el método para evaluar la colisión.
+Y la parte que evalua la colisión es:
+
+````
+      boolean itDied = false;
+      for (Snake otherSnake : allSnakes) {
+          //la otra serpiente es válida para chocar
+          if (otherSnake != snake && otherSnake.isAlive()) {
+              //Colisión
+              if (otherSnake.snapshot().contains(next)) {
+                  snake.kill();
+                  itDied = true;
+              }
+          }
+      }
+````
+En este revisa que el movimiento caiga en la posición de una serpiente que esté viva.
+
++ En `SnakeRunner` pase el arreglo de serpientes por el constructor para que este se lo pase al tablero cada vez que ejecute el método `step()` para que ahora haga lo mismo;
+pero, que revise si hay colisión con alguna serpiente viva. Finalmente, si `step()` retorna `KILLED` se termina el hilo con `return`.
++ En `SnakeApp` agregue `startTime` para medir el tiempo de en que inicio la creación del juego y restarselo al tiempo de las serpientes que mueren y así medir el tiempo más corto
+que una serpiente vivio. El método `togglePause()` se encarga de medir lo anterior y de determinar también la serpiente más larga y los resultados los muestra haciendo uso de JOptionPane.
+Por último, si la serpiente muere esta ya no será más pintada.
+
+### 4) Robustez bajo carga
+
+Al ejecutar el juego con 20 serpientes
+
+![iniciar el juego](/img_1.png)
+
+Luego todas las serpientes se crearon y conforma avanzaba el juego iban mueriendo
+
+![desarrollo del juego](/img_2.png)
+
+Finalmente, al pausar el juego se muestran las estádisticas solicitadas
+
+![pausar el juego](/img.png)
+
+
+---
 ## Créditos
 
 Este laboratorio es una adaptación modernizada del ejercicio **SnakeRace** de ARSW. El enunciado de actividades se conserva para mantener los objetivos pedagógicos del curso.
